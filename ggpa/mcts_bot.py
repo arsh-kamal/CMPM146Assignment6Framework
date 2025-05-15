@@ -1,7 +1,6 @@
 from __future__ import annotations
 import math
-from copy import deepcopy
-import time
+import random
 from agent import Agent
 from battle import BattleState
 from card import Card
@@ -9,87 +8,169 @@ from action.action import EndAgentTurn, PlayCard
 from game import GameState
 from ggpa.ggpa import GGPA
 from config import Verbose
-import random
 
 
-# You only need to modify the TreeNode!
 class TreeNode:
-    # You can change this to include other attributes. 
-    # param is the value passed via the -p command line option (default: 0.5)
-    # You can use this for e.g. the "c" value in the UCB-1 formula
     def __init__(self, param, parent=None):
-        self.children = {}
+        self.children = {}  # action.key() -> TreeNode
         self.parent = parent
-        self.results = []
-        self.param = param
+        self.results = []  # List of rollout scores
+        self.visits = 0  # Number of visits
+        self.action = None  # Action that led to this node (None for root)
+        self.param = param  # UCB-1 exploration parameter (c)
     
-    # REQUIRED function
-    # Called once per iteration
     def step(self, state):
+        """Perform one MCTS iteration."""
         self.select(state)
         
-    # REQUIRED function
-    # Called after all iterations are done; should return the 
-    # best action from among state.get_actions()
     def get_best(self, state):
-        return random.choice(state.get_actions())
+        """Return the action with the highest average score."""
+        if not self.children:
+            return random.choice(state.get_actions())
         
-    # REQUIRED function (implementation optional, but *very* helpful for debugging)
-    # Called after all iterations when the -v command line parameter is present
-    def print_tree(self, indent = 0):
-        pass
+        best_action = None
+        best_score = -float('inf')
+        available_keys = [action.key() for action in state.get_actions()]
+        for action_key, child in self.children.items():
+            if action_key not in available_keys:
+                continue  # Skip invalid actions
+            if child.visits > 0:
+                avg_score = sum(child.results) / child.visits
+                if avg_score > best_score:
+                    best_score = avg_score
+                    best_action = child.action
+        if best_action is None:
+            return random.choice(state.get_actions())
+        return best_action
+        
+    def print_tree(self, indent=0):
+        """Print the tree with scores and visit counts."""
+        for action_key, child in self.children.items():
+            avg_score = sum(child.results) / child.visits if child.visits > 0 else 0
+            print("  " * indent + f"{action_key}: {avg_score:.2f} (visits: {child.visits})")
+            child.print_tree(indent + 1)
 
-
-    # RECOMMENDED: select gets all actions available in the state it is passed
-    # If there are any child nodes missing (i.e. there are actions that have not 
-    # been explored yet), call expand with the available options
-    # Otherwise, pick a child node according to your selection criterion (e.g. UCB-1)
-    # apply its action to the state and recursively call select on that child node.
     def select(self, state):
-        pass
+        """Select a node using UCB-1, then expand and rollout if needed."""
+        available_actions = state.get_actions()
+        available_keys = [action.key() for action in available_actions]
+        
+        # Expand if there are unexplored actions
+        unexpanded = [action for action in available_actions if action.key() not in self.children]
+        if unexpanded:
+            self.expand(state, unexpanded)
+            return
+        
+        # Select child using UCB-1, skipping invalid actions
+        best_child = None
+        best_ucb = -float('inf')
+        total_visits = self.visits
+        valid_children = [child for child in self.children.values() if child.action.key() in available_keys]
+        
+        if not valid_children:
+            self.expand(state, available_actions)
+            return
+        
+        for child in valid_children:
+            if child.visits == 0:
+                ucb = float('inf')  # Prioritize unvisited nodes
+            else:
+                avg_score = sum(child.results) / child.visits
+                ucb = avg_score + self.param * math.sqrt(math.log(total_visits + 1) / child.visits)
+            if ucb > best_ucb:
+                best_ucb = ucb
+                best_child = child
+        
+        if best_child:
+            new_state = state.copy_undeterministic()
+            action_obj = best_child.action.to_action(new_state)
+            if action_obj is None:
+                print(f"WARNING: Action {best_child.action.key()} returned None in to_action")
+                self.expand(new_state, new_state.get_actions())
+                return
+            try:
+                new_state.step(best_child.action)
+                best_child.select(new_state)
+            except Exception as e:
+                print(f"ERROR: Failed to apply action {best_child.action.key()}: {e}")
+                self.expand(new_state, new_state.get_actions())
 
-    # RECOMMENDED: expand takes the available actions, and picks one at random,
-    # adds a child node corresponding to that action, applies the action ot the state
-    # and then calls rollout on that new node
     def expand(self, state, available):
-        pass 
+        """Expand by adding a new child for a random unexpanded action."""
+        if not available:
+            return  # No actions to expand
+        action = random.choice(available)
+        new_state = state.copy_undeterministic()
+        action_obj = action.to_action(new_state)
+        if action_obj is None:
+            print(f"WARNING: Expand action {action.key()} returned None in to_action")
+            return
+        try:
+            new_state.step(action)
+        except Exception as e:
+            print(f"ERROR: Failed to expand with action {action.key()}: {e}")
+            return
+        
+        child = TreeNode(self.param, parent=self)
+        child.action = action
+        self.children[action.key()] = child
+        
+        score = child.rollout(new_state)
+        child.backpropagate(score)
 
-    # RECOMMENDED: rollout plays the game randomly until its conclusion, and then 
-    # calls backpropagate with the result you get 
     def rollout(self, state):
-        pass
+        """Simulate random actions until game ends."""
+        current_state = state.copy_undeterministic()
+        while not current_state.ended():
+            actions = current_state.get_actions()
+            if not actions:
+                break
+            action = random.choice(actions)
+            action_obj = action.to_action(current_state)
+            if action_obj is None:
+                print(f"WARNING: Rollout action {action.key()} returned None in to_action")
+                continue
+            try:
+                current_state.step(action)
+            except Exception as e:
+                print(f"ERROR: Failed to apply rollout action {action.key()}: {e}")
+                break
+        return self.score(current_state)
         
-    # RECOMMENDED: backpropagate records the score you got in the current node, and 
-    # then recursively calls the parent's backpropagate as well.
-    # If you record scores in a list, you can use sum(self.results)/len(self.results)
-    # to get an average.
     def backpropagate(self, result):
-        pass
+        """Record score and propagate to parent."""
+        self.results.append(result)
+        self.visits += 1
+        if self.parent:
+            self.parent.backpropagate(result)
         
-    # RECOMMENDED: You can start by just using state.score() as the actual value you are 
-    # optimizing; for the challenge scenario, in particular, you may want to experiment
-    # with other options (e.g. squaring the score, or incorporating state.health(), etc.)
-    def score(self, state): 
-        return state.score()
-        
-        
-# You do not have to modify the MCTS Agent (but you can)
+    def score(self, state):
+        """Evaluate state: prioritize winning, penalize death."""
+        if state.get_end_result() == -1:  # Player dead
+            return -100  # Heavy penalty for losing
+        base_score = state.score()  # Damage dealt to monster
+        health_factor = state.health()  # Player health percentage
+        return base_score + 0.2 * health_factor if base_score < 1 else 1.0
+
+
 class MCTSAgent(GGPA):
     def __init__(self, iterations: int, verbose: bool, param: float):
+        super().__init__("MCTSAgent")
         self.iterations = iterations
         self.verbose = verbose
         self.param = param
 
-    # REQUIRED METHOD
     def choose_card(self, game_state: GameState, battle_state: BattleState) -> PlayCard | EndAgentTurn:
         actions = battle_state.get_actions()
         if len(actions) == 1:
-            return actions[0].to_action(battle_state)
+            action_obj = actions[0].to_action(battle_state)
+            if action_obj is None:
+                print(f"WARNING: Single action {actions[0].key()} returned None in to_action")
+                return EndAgentTurn()  # Fallback
+            return action_obj
     
         t = TreeNode(self.param)
-        start_time = time.time()
-
-        for i in range(self.iterations):
+        for _ in range(self.iterations):
             sample_state = battle_state.copy_undeterministic()
             t.step(sample_state)
         
@@ -99,13 +180,16 @@ class MCTSAgent(GGPA):
         
         if best_action is None:
             print("WARNING: MCTS did not return any action")
-            return random.choice(self.get_choose_card_options(game_state, battle_state)) # fallback option
-        return best_action.to_action(battle_state)
+            return EndAgentTurn()  # Fallback
+        
+        action_obj = best_action.to_action(battle_state)
+        if action_obj is None:
+            print(f"WARNING: Best action {best_action.key()} returned None in to_action")
+            return EndAgentTurn()  # Fallback
+        return action_obj
     
-    # REQUIRED METHOD: All our scenarios only have one enemy
     def choose_agent_target(self, battle_state: BattleState, list_name: str, agent_list: list[Agent]) -> Agent:
         return agent_list[0]
     
-    # REQUIRED METHOD: Our scenarios do not involve targeting cards
     def choose_card_target(self, battle_state: BattleState, list_name: str, card_list: list[Card]) -> Card:
         return card_list[0]
